@@ -1,7 +1,6 @@
 #Github.com-Vasusen-code
 #Modified: poll forwarding, message pinning, inline link rewriting
-#Bug fixes: PeerIdInvalid (separate status_chat from content target),
-#           syntax bug in rewrite_inline_links, resolve_peer for SAVE_CHANNEL
+#Bug fixes: PeerIdInvalid, 'bytes'.get() crash, poll answers, photo upload, no-media handling
 
 import asyncio, time, os, re
 
@@ -32,8 +31,7 @@ async def resolve_peer_safe(client, chat_id):
     Ensure Pyrogram has the access hash for `chat_id` in its session cache.
 
     Pyrogram raises PeerIdInvalid when it knows a numeric channel ID but
-    hasn't stored the access hash yet (i.e. the channel hasn't appeared in
-    any update since the session was created). Walking get_dialogs() forces
+    hasn't stored the access hash yet. Walking get_dialogs() forces
     Pyrogram to fetch & cache access hashes for every channel the account
     is in, which fixes the error.
 
@@ -146,7 +144,7 @@ def rewrite_inline_links(text, original_chat_id, new_chat_id):
             link_msg_id = int(private_match.group(2))
             map_key = (link_chat, link_msg_id)
             if map_key in msg_map:
-                new_msg_id = msg_map[map_key]  # FIXED: was msg_mapap_key]
+                new_msg_id = msg_map[map_key]
                 if isinstance(new_chat_id, int) and str(new_chat_id).startswith('-100'):
                     short_id = str(new_chat_id)[4:]  # Remove -100 prefix
                     return f"https://t.me/c/{short_id}/{new_msg_id}"
@@ -162,7 +160,7 @@ def rewrite_inline_links(text, original_chat_id, new_chat_id):
 
             map_key_str = (link_chat, link_msg_id)
             if map_key_str in msg_map:
-                new_msg_id = msg_map[map_key_str]  # FIXED: was msg_mapap_key_str]
+                new_msg_id = msg_map[map_key_str]
                 if isinstance(new_chat_id, int) and str(new_chat_id).startswith('-100'):
                     short_id = str(new_chat_id)[4:]
                     return f"https://t.me/c/{short_id}/{new_msg_id}"
@@ -208,26 +206,21 @@ async def forward_poll(client, target_chat, msg, status_msg):
     is_anonymous = poll.is_anonymous
 
     # Find the correct answer for quiz polls
+    # In Pyrogram v4, poll.correct_option_index is directly available
+    # (it comes from Telegram's Poll object which always has it for quiz polls)
+    # NOTE: We do NOT try to read opt.data because in Pyrogram v4,
+    # opt.data is raw bytes (not a dict), and calling .get() on bytes
+    # causes "'bytes' object has no attribute 'get'" error.
     correct_option_index = None
     if is_quiz:
-        if hasattr(poll, 'correct_option_index') and poll.correct_option_index is not None:
-            correct_option_index = poll.correct_option_index
-        else:
-            for idx, opt in enumerate(poll.options):
-                if hasattr(opt, 'data') and opt.data and opt.data.get('correct', False):
-                    correct_option_index = idx
-                    break
-            if correct_option_index is None:
-                correct_option_index = 0
+        correct_option_index = getattr(poll, 'correct_option_index', None)
+        # Fallback: if for some reason it's not set, default to 0
+        if correct_option_index is None:
+            correct_option_index = 0
 
     # Build explanation if available (for quiz polls)
-    explanation = None
-    if hasattr(poll, 'explanation') and poll.explanation:
-        explanation = poll.explanation
-
-    explanation_entities = None
-    if hasattr(poll, 'explanation_entities') and poll.explanation_entities:
-        explanation_entities = poll.explanation_entities
+    explanation = getattr(poll, 'explanation', None)
+    explanation_entities = getattr(poll, 'explanation_entities', None)
 
     # Update status in user's DM
     try:
@@ -268,13 +261,15 @@ async def forward_poll(client, target_chat, msg, status_msg):
         for idx, opt in enumerate(poll.options):
             marker = ""
             if is_quiz and idx == correct_option_index:
-                marker = " (Correct)"
+                marker = " ✓ (Correct Answer)"
             vote_info += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s){marker}\n"
 
         await client.send_message(target_chat, vote_info)
 
     except Exception as e:
         print(f"Poll forward error: {e}")
+        import traceback
+        traceback.print_exc()
         # Fallback: send poll details as text if re-creation fails
         poll_text = "**Poll (could not re-create):**\n\n"
         poll_text += f"**Question:** {poll.question}\n"
@@ -328,8 +323,6 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
         file = ""
         try:
             # Ensure the access hash for this channel is in Pyrogram's cache.
-            # Without this, private channels the userbot hasn't interacted with
-            # in this session raise PeerIdInvalid even when the account is a member.
             await resolve_peer_safe(userbot, chat)
             msg = await userbot.get_messages(chat, msg_id)
 
@@ -362,6 +355,11 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                     await pin_if_channel(client, sender, sent_msg.id)
                     await edit.delete()
                     return
+                else:
+                    # Message has neither media nor text (service message, etc.)
+                    await client.edit_message_text(status_chat, edit_id, "No content to save (empty message).")
+                    return
+
             edit = await client.edit_message_text(status_chat, edit_id, "Trying to Download.")
             file = await userbot.download_media(
                 msg,
@@ -373,6 +371,12 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                     time.time()
                 )
             )
+
+            # If download_media returns None, the message doesn't have downloadable media
+            if not file:
+                await client.edit_message_text(status_chat, edit_id, "This message doesn't contain any downloadable media.")
+                return
+
             print(file)
             await edit.edit('Preparing to Upload!')
             caption = None
@@ -429,8 +433,26 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                 )
 
             elif msg.media==MessageMediaType.PHOTO:
+                # FIX: Use Pyrogram's send_photo instead of Telethon's send_file
+                # Telethon's send_file sends as document, causing
+                # "The number of file parts is invalid" errors
                 await edit.edit("Uploading photo.")
-                sent_msg = await bot.send_file(sender, file, caption=caption)
+                try:
+                    sent_msg = await client.send_photo(
+                        chat_id=sender,
+                        photo=file,
+                        caption=caption,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client,
+                            '**UPLOADING:**\n',
+                            edit,
+                            time.time()
+                        )
+                    )
+                except Exception as photo_err:
+                    print(f"send_photo failed, falling back to bot.send_file: {photo_err}")
+                    sent_msg = await bot.send_file(sender, file, caption=caption)
             else:
                 thumb_path=thumbnail(sender)
                 sent_msg = await client.send_document(
@@ -476,6 +498,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
             if "messages.SendMedia" in str(e) \
             or "SaveBigFilePartRequest" in str(e) \
             or "SendMediaRequest" in str(e) \
+            or "number of file parts" in str(e) \
             or str(e) == "File size equals to 0 B":
                 try:
                     if msg.media==MessageMediaType.VIDEO and msg.video.mime_type in ["video/mp4", "video/x-matroska"]:
@@ -484,9 +507,14 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                         attributes = [DocumentAttributeVideo(duration=duration, w=width, h=height, round_message=round_message, supports_streaming=True)]
                         sent_msg = await bot.send_file(sender, uploader, caption=caption, thumb=thumb_path, attributes=attributes, force_document=False)
                     elif msg.media==MessageMediaType.VIDEO_NOTE:
+                        UT = time.time()
                         uploader = await fast_upload(f'{file}', f'{file}', UT, bot, edit, '**UPLOADING:**')
                         attributes = [DocumentAttributeVideo(duration=duration, w=width, h=height, round_message=round_message, supports_streaming=True)]
                         sent_msg = await bot.send_file(sender, uploader, caption=caption, thumb=thumb_path, attributes=attributes, force_document=False)
+                    elif msg.media==MessageMediaType.PHOTO:
+                        # FIX: Use Telethon bot as fallback for photos too
+                        UT = time.time()
+                        sent_msg = await bot.send_file(sender, file, caption=caption)
                     else:
                         UT = time.time()
                         uploader = await fast_upload(f'{file}', f'{file}', UT, bot, edit, '**UPLOADING:**')
