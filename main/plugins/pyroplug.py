@@ -81,6 +81,11 @@ def thumbnail(sender):
 # Pin the message to the saved channel
 # ---------------------------------------------------------------------------
 async def pin_if_channel(client, chat_id, msg_id):
+    """Pin a message, but only in channels/groups (not in private DMs).
+    Bots get BOT_ONESIDE_NOT_AVAIL error when trying to pin in DMs."""
+    # Skip pinning in private chats (user DMs have positive IDs)
+    if isinstance(chat_id, int) and chat_id > 0:
+        return
     try:
         await client.pin_chat_message(
             chat_id=chat_id,
@@ -301,7 +306,7 @@ async def forward_poll(client, target_chat, msg, status_msg, original_chat=None,
     # ---- Strategy 2: Telethon raw API for quiz poll ----
     if is_quiz and sent_msg is None:
         try:
-            from telethon.tl.types import InputMediaPoll, Poll as TLPoll, PollAnswer, TextWithEntities
+            from telethon.tl.types import InputMediaPoll, Poll as TLPoll, PollAnswer
             from telethon.tl.functions.messages import SendMediaRequest
 
             # Build TL Poll object
