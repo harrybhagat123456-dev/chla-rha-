@@ -1,26 +1,30 @@
 #!/bin/bash
-# Sync from GitHub - handles unstaged changes gracefully
-# This script stashes any runtime-modified files before pulling
+# Sync from GitHub - hard reset to match remote exactly
+# The deployment server should NEVER try to rebase or push.
+# It should always be a mirror of what's on GitHub.
 
 cd /home/runner/workspace || exit 0
 
 echo "[sync] Fetching latest changes from GitHub..."
 
-# Stash any unstaged changes (session files, __pycache__, etc.)
-git stash --include-untracked 2>/dev/null || true
+# Fetch the latest from origin
+git fetch origin main 2>/dev/null
 
-# Pull with rebase
-git pull --rebase origin main 2>/dev/null
-
-if [ $? -eq 0 ]; then
-    echo "[sync] Successfully pulled latest changes."
-else
-    # If pull still fails, try a hard reset to match remote
-    echo "[sync] Pull failed, forcing clean state..."
-    git fetch origin main 2>/dev/null
-    git reset --hard origin/main 2>/dev/null
-    echo "[sync] Reset to origin/main."
+if [ $? -ne 0 ]; then
+    echo "[sync] Fetch failed, will try again next cycle."
+    exit 0
 fi
 
-# Restore any stashed changes that are still relevant
-git stash pop 2>/dev/null || true
+# Hard reset to match origin/main exactly
+# This discards any local changes (session files, __pycache__, etc.)
+# and makes the local branch identical to the remote.
+git reset --hard origin/main 2>/dev/null
+
+if [ $? -eq 0 ]; then
+    echo "[sync] Successfully synced to latest changes."
+else
+    echo "[sync] Reset failed."
+fi
+
+# Clean untracked files (session files, downloads, __pycache__)
+git clean -fd 2>/dev/null || true
