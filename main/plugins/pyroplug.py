@@ -26,6 +26,9 @@ msg_map = {}
 # Cache of channel IDs we've already resolved to avoid repeated dialog scans
 _resolved_peers = set()
 
+# Cache of pinned message IDs per chat: {chat_id: set_of_msg_ids}
+_pinned_cache = {}
+
 # Media types that can be downloaded via userbot.download_media()
 DOWNLOADABLE_MEDIA = {
     MessageMediaType.VIDEO, MessageMediaType.VIDEO_NOTE,
@@ -80,11 +83,49 @@ def thumbnail(sender):
 # ---------------------------------------------------------------------------
 # Pin the message to the saved channel
 # ---------------------------------------------------------------------------
-async def pin_if_channel(client, chat_id, msg_id):
-    """Pin a message, but only in channels/groups (not in private DMs).
+async def get_pinned_msg_ids(client, chat_id):
+    """Fetch and cache pinned message IDs from a source chat.
+    Uses Telethon raw API (GetPinnedMessagesRequest) with Pyrogram get_chat fallback."""
+    # Return cached if available
+    if chat_id in _pinned_cache:
+        return _pinned_cache[chat_id]
+
+    pinned_ids = set()
+
+    # Method 1: Try Telethon raw API (GetPinnedMessagesRequest)
+    try:
+        from telethon.tl.functions.messages import GetPinnedMessagesRequest
+        result = await Drone(GetPinnedMessagesRequest(peer=chat_id))
+        if result and hasattr(result, 'messages'):
+            for m in result.messages:
+                if hasattr(m, 'id'):
+                    pinned_ids.add(m.id)
+            print(f"[PIN] Found {len(pinned_ids)} pinned messages via GetPinnedMessagesRequest")
+    except Exception as e:
+        print(f"[PIN] GetPinnedMessagesRequest failed: {e}")
+
+    # Method 2: Fallback — check chat.pinned_message (only gets the latest pinned)
+    if not pinned_ids:
+        try:
+            chat_info = await client.get_chat(chat_id)
+            if chat_info and hasattr(chat_info, 'pinned_message') and chat_info.pinned_message:
+                pinned_ids.add(chat_info.pinned_message.id)
+                print(f"[PIN] Found 1 pinned message via chat.pinned_message (ID: {chat_info.pinned_message.id})")
+        except Exception as e:
+            print(f"[PIN] chat.pinned_message fallback failed: {e}")
+
+    _pinned_cache[chat_id] = pinned_ids
+    return pinned_ids
+
+
+async def pin_if_channel(client, chat_id, msg_id, was_pinned=False):
+    """Pin a message in channels/groups only if it was pinned in the original chat.
     Bots get BOT_ONESIDE_NOT_AVAIL error when trying to pin in DMs."""
     # Skip pinning in private chats (user DMs have positive IDs)
     if isinstance(chat_id, int) and chat_id > 0:
+        return
+    # Only pin if the original message was pinned
+    if not was_pinned:
         return
     try:
         await client.pin_chat_message(
@@ -92,6 +133,7 @@ async def pin_if_channel(client, chat_id, msg_id):
             message_id=msg_id,
             both_sides=False
         )
+        print(f"[PIN] Pinned message {msg_id} in {chat_id}")
     except Exception as e:
         print(f"Could not pin message {msg_id} in {chat_id}: {e}")
 
@@ -507,6 +549,9 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
     # Before doing anything, ensure the bot client can resolve the target chat
     await ensure_target_peer(client, sender)
 
+    # Determine if this message was pinned in the original chat
+    was_pinned = False
+
     if 't.me/c/' in msg_link or 't.me/b/' in msg_link:
         if 't.me/b/' in msg_link:
             chat = str(msg_link.split("/")[-2])
@@ -518,13 +563,22 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
             await resolve_peer_safe(userbot, chat)
             msg = await userbot.get_messages(chat, msg_id)
 
+            # Check if this message was pinned in the original chat
+            try:
+                pinned_ids = await get_pinned_msg_ids(client, chat)
+                was_pinned = msg_id in pinned_ids
+                if was_pinned:
+                    print(f"[PIN] Message {msg_id} was pinned in original chat")
+            except Exception as e:
+                print(f"[PIN] Could not check pinned status: {e}")
+
             # ---- POLL HANDLING ----
             if msg.poll is not None:
                 edit = await client.edit_message_text(status_chat, edit_id, "Processing poll...")
                 sent_msg = await forward_poll(client, sender, msg, edit, original_chat=chat, sender=sender)
                 if sent_msg:
                     register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                    await pin_if_channel(client, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                 await edit.delete()
                 return
             # ---- END POLL HANDLING ----
@@ -536,7 +590,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                 rewritten = rewrite_inline_links(text, chat, sender)
                 sent_msg = await client.send_message(sender, rewritten)
                 register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                await pin_if_channel(client, sender, sent_msg.id)
+                await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                 await edit.delete()
                 return
 
@@ -573,7 +627,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                     sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
                     if sent_msg:
                         register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                        await pin_if_channel(client, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                         await edit.delete()
                     else:
                         await client.edit_message_text(status_chat, edit_id, f"Could not save message `{msg_link}`")
@@ -718,7 +772,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                 # Register mapping and pin the message
                 if sent_msg:
                     register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                    await pin_if_channel(client, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
 
                 try:
                     os.remove(file)
@@ -738,7 +792,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                 sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
                 if sent_msg:
                     register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                    await pin_if_channel(client, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                 else:
                     # Last resort: send whatever text we can extract
                     fallback_text = ""
@@ -750,7 +804,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                         rewritten = rewrite_inline_links(fallback_text, chat, sender)
                         sent_msg = await client.send_message(sender, f"[Unsupported media] {rewritten}")
                         register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                        await pin_if_channel(client, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                     else:
                         print(f"[WARN] Could not save message {msg_id} — no text, no downloadable media")
                 await edit.delete()
@@ -795,7 +849,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
 
                     if sent_msg:
                         register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                        await pin_if_channel(client, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
 
                     if os.path.isfile(file) == True:
                         os.remove(file)
@@ -812,7 +866,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                     sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
                     if sent_msg:
                         register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                        await pin_if_channel(client, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                         await client.edit_message_text(status_chat, edit_id, "Saved via copy (upload failed).")
                     else:
                         await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e2)}')
@@ -825,7 +879,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                 sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
                 if sent_msg:
                     register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                    await pin_if_channel(client, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                     await client.edit_message_text(status_chat, edit_id, "Saved via copy (direct upload failed).")
                 else:
                     await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
@@ -847,12 +901,21 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
         try:
             msg = await client.get_messages(chat, msg_id)
 
+            # Check if this message was pinned in the original public chat
+            try:
+                pinned_ids = await get_pinned_msg_ids(client, chat)
+                was_pinned = msg_id in pinned_ids
+                if was_pinned:
+                    print(f"[PIN] Message {msg_id} was pinned in original public chat")
+            except Exception as e:
+                print(f"[PIN] Could not check pinned status for public chat: {e}")
+
             # ---- POLL HANDLING for public chats ----
             if msg.poll is not None:
                 sent_msg = await forward_poll(client, sender, msg, edit, original_chat=chat, sender=sender)
                 if sent_msg:
                     register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                    await pin_if_channel(client, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
                 await edit.delete()
                 return
 
@@ -864,7 +927,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
             sent_msg = await client.copy_message(sender, chat, msg_id)
             if sent_msg:
                 register_msg_mapping(chat, msg_id, sender, sent_msg.id)
-                await pin_if_channel(client, sender, sent_msg.id)
+                await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
 
                 if msg.text:
                     original_text = msg.text.markdown if msg.text else ""
