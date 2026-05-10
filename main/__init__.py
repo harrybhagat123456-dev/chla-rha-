@@ -6,7 +6,7 @@ from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
 
 from decouple import config
-import logging, time, sys
+import logging, time, sys, traceback
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
                     level=logging.WARNING)
@@ -26,8 +26,9 @@ userbot = Client("saverestricted", session_string=SESSION, api_hash=API_HASH, ap
 
 try:
     userbot.start()
-except BaseException:
-    print("Userbot Error ! Have you added SESSION while deploying??")
+except BaseException as e:
+    print("Userbot failed to start. Full error:")
+    traceback.print_exc()
     sys.exit(1)
 
 Bot = Client(
@@ -40,7 +41,8 @@ Bot = Client(
 try:
     Bot.start()
 except Exception as e:
-    print(e)
+    print("Bot (Pyrogram) failed to start:")
+    traceback.print_exc()
     sys.exit(1)
 
 # Resolve SAVE_CHANNEL peer for the Pyrogram bot client so it doesn't

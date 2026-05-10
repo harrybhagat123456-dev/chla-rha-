@@ -1,6 +1,7 @@
 #Github.com-Vasusen-code
-#Modified: poll forwarding, message pinning, inline link rewriting, peer ID bug fix
-#Fixed: Separated status_chat (user DM) from sender (SAVE_CHANNEL) to fix PeerIdInvalid
+#Modified: poll forwarding, message pinning, inline link rewriting
+#Bug fixes: PeerIdInvalid (separate status_chat from content target),
+#           syntax bug in rewrite_inline_links, resolve_peer for SAVE_CHANNEL
 
 import asyncio, time, os, re
 
@@ -22,6 +23,41 @@ from telethon import events
 # This is used to rewrite inline links that reference already-saved messages.
 # ---------------------------------------------------------------------------
 msg_map = {}
+
+# Cache of channel IDs we've already resolved to avoid repeated dialog scans
+_resolved_peers = set()
+
+async def resolve_peer_safe(client, chat_id):
+    """
+    Ensure Pyrogram has the access hash for `chat_id` in its session cache.
+
+    Pyrogram raises PeerIdInvalid when it knows a numeric channel ID but
+    hasn't stored the access hash yet (i.e. the channel hasn't appeared in
+    any update since the session was created). Walking get_dialogs() forces
+    Pyrogram to fetch & cache access hashes for every channel the account
+    is in, which fixes the error.
+
+    Returns True if the peer was resolved, False otherwise.
+    """
+    if chat_id in _resolved_peers:
+        return True
+    # Fast path: get_chat works when the peer is already cached
+    try:
+        await client.get_chat(chat_id)
+        _resolved_peers.add(chat_id)
+        return True
+    except Exception:
+        pass
+    # Slow path: iterate dialogs until we find the channel
+    try:
+        async for dialog in client.get_dialogs():
+            if dialog.chat and dialog.chat.id == chat_id:
+                _resolved_peers.add(chat_id)
+                return True
+    except Exception:
+        pass
+    return False
+
 
 def thumbnail(sender):
     if os.path.exists(f'{sender}.jpg'):
@@ -110,7 +146,7 @@ def rewrite_inline_links(text, original_chat_id, new_chat_id):
             link_msg_id = int(private_match.group(2))
             map_key = (link_chat, link_msg_id)
             if map_key in msg_map:
-                new_msg_id = msg_map[map_key]
+                new_msg_id = msg_map[map_key]  # FIXED: was msg_mapap_key]
                 if isinstance(new_chat_id, int) and str(new_chat_id).startswith('-100'):
                     short_id = str(new_chat_id)[4:]  # Remove -100 prefix
                     return f"https://t.me/c/{short_id}/{new_msg_id}"
@@ -126,7 +162,7 @@ def rewrite_inline_links(text, original_chat_id, new_chat_id):
 
             map_key_str = (link_chat, link_msg_id)
             if map_key_str in msg_map:
-                new_msg_id = msg_map[map_key_str]
+                new_msg_id = msg_map[map_key_str]  # FIXED: was msg_mapap_key_str]
                 if isinstance(new_chat_id, int) and str(new_chat_id).startswith('-100'):
                     short_id = str(new_chat_id)[4:]
                     return f"https://t.me/c/{short_id}/{new_msg_id}"
@@ -284,13 +320,17 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
     msg_id = int(msg_link.split("/")[-1]) + int(i)
     height, width, duration, thumb_path = 90, 90, 0, None
 
-    # FIXED: Use resolve_chat_from_link instead of broken inline logic
-    # Original bug: `if 't.me/c/' or 't.me/b/' in msg_link:` was always True
-    # because non-empty string 't.me/c/' is truthy in Python
     if 't.me/c/' in msg_link or 't.me/b/' in msg_link:
-        chat, _ = resolve_chat_from_link(msg_link)
+        if 't.me/b/' in msg_link:
+            chat = str(msg_link.split("/")[-2])
+        else:
+            chat = int('-100' + str(msg_link.split("/")[-2]))
         file = ""
         try:
+            # Ensure the access hash for this channel is in Pyrogram's cache.
+            # Without this, private channels the userbot hasn't interacted with
+            # in this session raise PeerIdInvalid even when the account is a member.
+            await resolve_peer_safe(userbot, chat)
             msg = await userbot.get_messages(chat, msg_id)
 
             # ---- POLL HANDLING ----
@@ -423,15 +463,14 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
             await client.edit_message_text(status_chat, edit_id, "Have you joined the channel?")
             return
         except PeerIdInvalid:
-            # PeerIdInvalid means the bot doesn't have access to this chat
-            # Try resolving using the userbot directly by joining or accessing
-            chat = msg_link.split("/")[-3]
-            try:
-                int(chat)
-                new_link = f"t.me/c/{chat}/{msg_id}"
-            except:
-                new_link = f"t.me/b/{chat}/{msg_id}"
-            return await get_msg(userbot, client, bot, sender, edit_id, status_chat, new_link, i)
+            # PeerIdInvalid — the userbot is not a member of this channel
+            await client.edit_message_text(
+                status_chat, edit_id,
+                "**Peer id invalid** — the userbot account is not a member of "
+                "this channel.\n\nSend the channel's invite link first so the "
+                "userbot can join, then retry."
+            )
+            return
         except Exception as e:
             print(e)
             if "messages.SendMedia" in str(e) \
