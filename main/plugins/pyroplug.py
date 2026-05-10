@@ -754,6 +754,157 @@ def register_msg_mapping(original_chat, original_msg_id, new_chat_id, new_msg_id
 
 
 # ---------------------------------------------------------------------------
+# Describe service messages as readable text
+# ---------------------------------------------------------------------------
+def _describe_service_message(msg):
+    """Extract a readable description from a Telegram service message."""
+    parts = []
+
+    # Pinned message
+    if msg.pinned_message:
+        pin_text = msg.pinned_message.text if msg.pinned_message.text else "(media message)"
+        parts.append(f"Pinned message: {pin_text[:200]}")
+
+    # New chat members
+    if msg.new_chat_members:
+        names = []
+        for member in msg.new_chat_members:
+            name = getattr(member, 'first_name', None) or getattr(member, 'title', None) or str(member.id)
+            names.append(name)
+        parts.append(f"New members joined: {', '.join(names)}")
+
+    # Left chat member
+    if msg.left_chat_member:
+        name = getattr(msg.left_chat_member, 'first_name', None) or str(msg.left_chat_member.id)
+        parts.append(f"Member left: {name}")
+
+    # New chat title
+    if msg.new_chat_title:
+        parts.append(f"Chat renamed to: {msg.new_chat_title}")
+
+    # New chat photo
+    if msg.new_chat_photo:
+        parts.append("Chat photo updated")
+
+    # Delete chat photo
+    if msg.delete_chat_photo:
+        parts.append("Chat photo removed")
+
+    # Group created
+    if msg.group_chat_created:
+        parts.append("Group chat created")
+
+    # Supergroup created
+    if msg.supergroup_chat_created:
+        parts.append("Supergroup/channel created")
+
+    # Channel created
+    if msg.channel_chat_created:
+        parts.append("Channel created")
+
+    # Video chat started
+    if msg.video_chat_started:
+        parts.append("Video chat started")
+
+    # Video chat ended
+    if msg.video_chat_ended:
+        parts.append("Video chat ended")
+
+    # Video chat members invited
+    if msg.video_chat_members_invited:
+        names = []
+        for member in msg.video_chat_members_invited.users:
+            name = getattr(member, 'first_name', None) or str(member.id)
+            names.append(name)
+        parts.append(f"Video chat invited: {', '.join(names)}")
+
+    # Forum topic created
+    if msg.forum_topic_created:
+        parts.append(f"Forum topic created: {msg.forum_topic_created.title}")
+
+    # Forum topic edited
+    if msg.forum_topic_edited:
+        new_title = getattr(msg.forum_topic_edited, 'title', None)
+        if new_title:
+            parts.append(f"Forum topic renamed to: {new_title}")
+        else:
+            parts.append("Forum topic settings updated")
+
+    # Forum topic closed
+    if msg.forum_topic_closed:
+        parts.append("Forum topic closed")
+
+    # Forum topic reopened
+    if msg.forum_topic_reopened:
+        parts.append("Forum topic reopened")
+
+    # General topic hidden/unhidden
+    if msg.general_topic_hidden:
+        parts.append("General topic hidden")
+    if msg.general_topic_unhidden:
+        parts.append("General topic unhidden")
+
+    # Giveaway
+    if msg.giveaway_created:
+        parts.append("Giveaway created")
+    if msg.giveaway:
+        parts.append(f"Giveaway: {msg.giveaway.prize_description or 'prizes'} for {msg.giveaway.quantity} winner(s)")
+    if msg.giveaway_winners:
+        parts.append("Giveaway winners announced")
+    if msg.giveaway_completed:
+        parts.append("Giveaway completed")
+
+    if parts:
+        return '\n'.join(parts)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Send Direct — file_id reuse (instant, no download)
+# Works when the bot can see the source message (public channels or channels
+# the bot is a member of). This is the devgaganin pattern for speed.
+# ---------------------------------------------------------------------------
+async def send_direct(client, msg, target_chat, caption=None):
+    """
+    Try to send media by reusing file_id from the source message.
+    This is instant — no download/upload needed.
+    Returns the sent message or None if not possible.
+    """
+    try:
+        if msg.video:
+            return await client.send_video(target_chat, msg.video.file_id, caption=caption)
+        elif msg.photo:
+            file_id = msg.photo.file_id if hasattr(msg.photo, 'file_id') else msg.photo[-1].file_id
+            return await client.send_photo(target_chat, file_id, caption=caption)
+        elif msg.document:
+            # Smart file type detection by extension (devgaganin pattern)
+            file_name = getattr(msg.document, 'file_name', '') or ''
+            file_ext = os.path.splitext(file_name)[1].lower() if file_name else ''
+            video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.ts', '.m4v'}
+            audio_exts = {'.mp3', '.m4a', '.flac', '.wav', '.ogg', '.opus', '.aac', '.wma'}
+
+            if msg.document.mime_type and msg.document.mime_type.startswith('video/') or file_ext in video_exts:
+                return await client.send_video(target_chat, msg.document.file_id, caption=caption)
+            elif msg.document.mime_type and msg.document.mime_type.startswith('audio/') or file_ext in audio_exts:
+                return await client.send_audio(target_chat, msg.document.file_id, caption=caption)
+            else:
+                return await client.send_document(target_chat, msg.document.file_id, caption=caption)
+        elif msg.audio:
+            return await client.send_audio(target_chat, msg.audio.file_id, caption=caption)
+        elif msg.voice:
+            return await client.send_voice(target_chat, msg.voice.file_id, caption=caption)
+        elif msg.animation:
+            return await client.send_animation(target_chat, msg.animation.file_id, caption=caption)
+        elif msg.video_note:
+            return await client.send_video_note(target_chat, msg.video_note.file_id)
+        elif msg.sticker:
+            return await client.send_sticker(target_chat, msg.sticker.file_id)
+    except Exception as e:
+        print(f"[DIRECT] send_direct failed (will fall back to download): {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core message handler
 # ---------------------------------------------------------------------------
 async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, i):
@@ -788,9 +939,45 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
             chat = int('-100' + str(msg_link.split("/")[-2]))
         file = ""
         try:
+            # ---- Refresh dialogs so userbot knows about all channels ----
+            try:
+                async for _ in userbot.get_dialogs(limit=50):
+                    pass
+            except Exception:
+                pass
+
             # Ensure the access hash for this channel is in userbot's cache.
             await resolve_peer_safe(userbot, chat)
-            msg = await userbot.get_messages(chat, msg_id)
+
+            # ---- Try multiple chat ID formats (devgaganin pattern) ----
+            msg = None
+            chat_id_formats = [chat]
+
+            # Also try the -XXX format if chat is -100XXX
+            if isinstance(chat, int) and str(chat).startswith('-100'):
+                alt_format = int('-' + str(chat)[5:])
+                chat_id_formats.append(alt_format)
+
+            for cid in chat_id_formats:
+                try:
+                    msg = await userbot.get_messages(cid, msg_id)
+                    if msg and not getattr(msg, 'empty', False):
+                        break
+                except Exception:
+                    continue
+
+            # Final fallback: refresh all dialogs and retry
+            if msg is None or getattr(msg, 'empty', False):
+                try:
+                    async for _ in userbot.get_dialogs(limit=200):
+                        pass
+                    msg = await userbot.get_messages(chat, msg_id)
+                except Exception:
+                    pass
+
+            if msg is None or getattr(msg, 'empty', False):
+                await client.edit_message_text(status_chat, edit_id, "Could not fetch the message. Is the userbot a member of this channel?")
+                return
 
             # Check if this message was pinned in the original chat
             try:
@@ -800,6 +987,20 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                     print(f"[PIN] Message {msg_id} was pinned in original chat")
             except Exception as e:
                 print(f"[PIN] Could not check pinned status: {e}")
+
+            # ---- SERVICE MESSAGE HANDLING ----
+            # Service messages: pin notifications, join/leave, channel edits, etc.
+            if msg.service:
+                service_text = _describe_service_message(msg)
+                if service_text:
+                    sent_msg = await client.send_message(sender, f"📋 **Service Message:**\n{service_text}")
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
+                else:
+                    print(f"[INFO] Skipped service message {msg_id} (no extractable info)")
+                await client.edit_message_text(status_chat, edit_id, "Saved service message.")
+                return
+            # ---- END SERVICE MESSAGE HANDLING ----
 
             # ---- POLL HANDLING ----
             if msg.poll is not None:
@@ -1130,6 +1331,18 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
         try:
             msg = await client.get_messages(chat, msg_id)
 
+            # ---- Bot can't see this public message? Try userbot ----
+            if getattr(msg, 'empty', False):
+                try:
+                    await userbot.join_chat(chat)
+                except Exception:
+                    pass
+                try:
+                    chat_info = await userbot.get_chat(f"@{chat}" if not chat.startswith('-') else chat)
+                    msg = await userbot.get_messages(chat_info.id, msg_id)
+                except Exception:
+                    pass
+
             # Check if this message was pinned in the original public chat
             try:
                 pinned_ids = await get_pinned_msg_ids(userbot, client, chat)
@@ -1148,11 +1361,43 @@ async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, 
                 await edit.delete()
                 return
 
-            if msg.empty:
+            # ---- SERVICE MESSAGE for public chats ----
+            if getattr(msg, 'service', False):
+                service_text = _describe_service_message(msg)
+                if service_text:
+                    sent_msg = await client.send_message(sender, f"📋 **Service Message:**\n{service_text}")
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
+                await edit.delete()
+                return
+
+            if getattr(msg, 'empty', False):
                 new_link = f't.me/b/{chat}/{int(msg_id)}'
                 return await get_msg(userbot, client, bot, sender, edit_id, status_chat, new_link, i)
 
-            # For public chats, use copy_message
+            # ---- Try send_direct first (file_id reuse — instant, no download) ----
+            caption = None
+            if msg.caption is not None:
+                caption = rewrite_inline_links(msg.caption, chat, sender)
+            sent_msg = await send_direct(client, msg, sender, caption=caption)
+
+            # ---- If send_direct worked, just register and pin ----
+            if sent_msg:
+                register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                await pin_if_channel(client, sender, sent_msg.id, was_pinned=was_pinned)
+                # Rewrite inline links if there's text
+                if msg.text:
+                    original_text = msg.text.markdown if msg.text else ""
+                    rewritten = rewrite_inline_links(original_text, chat, sender)
+                    if rewritten != original_text:
+                        try:
+                            await client.edit_message_text(sender, sent_msg.id, rewritten)
+                        except Exception as e:
+                            print(f"Could not edit message for inline link rewriting: {e}")
+                await edit.delete()
+                return
+
+            # ---- Fallback: copy_message for public chats ----
             sent_msg = await client.copy_message(sender, chat, msg_id)
             if sent_msg:
                 register_msg_mapping(chat, msg_id, sender, sent_msg.id)
