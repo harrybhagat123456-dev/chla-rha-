@@ -1,5 +1,6 @@
 #Github.com-Vasusen-code
 #Modified: poll forwarding, message pinning, inline link rewriting, peer ID bug fix
+#Fixed: Separated status_chat (user DM) from sender (SAVE_CHANNEL) to fix PeerIdInvalid
 
 import asyncio, time, os, re
 
@@ -63,18 +64,13 @@ def resolve_chat_from_link(msg_link):
         (chat, is_private) tuple - chat is int for private, str for public/bot
     """
     if 't.me/c/' in msg_link:
-        # Private channel link: t.me/c/<channel_id>/<msg_id>
-        # The channel_id in the URL is WITHOUT the -100 prefix
-        # Pyrogram needs the full -100 prefixed ID
         channel_id = msg_link.split("/")[-2]
         chat = int('-100' + channel_id)
         return chat, True
     elif 't.me/b/' in msg_link:
-        # Bot chat link: t.me/b/<bot_username>/<msg_id>
         chat = str(msg_link.split("/")[-2])
         return chat, True
     else:
-        # Public channel/group: t.me/<username>/<msg_id>
         chat = str(msg_link.split("/")[-2])
         return chat, False
 
@@ -149,19 +145,17 @@ def rewrite_inline_links(text, original_chat_id, new_chat_id):
 # ---------------------------------------------------------------------------
 # Poll forwarding
 # ---------------------------------------------------------------------------
-async def forward_poll(client, sender, msg, edit):
+async def forward_poll(client, target_chat, msg, status_msg):
     """
     Forward a poll message by re-creating the poll with the same question,
     options, and answer details. Since Telegram doesn't allow directly
     forwarding polls from restricted chats, we reconstruct the poll.
 
-    The poll is re-created with:
-    - Same question text
-    - Same option texts in the same order
-    - Same poll type (regular/quiz)
-    - Same anonymous setting
-    - For quiz polls, the correct answer index is preserved
-    - Vote counts per option are included in a follow-up summary
+    Args:
+        client: Pyrogram bot client
+        target_chat: The chat where the poll should be sent (SAVE_CHANNEL or user DM)
+        msg: The original message containing the poll
+        status_msg: The status message in the user's DM to update progress
 
     Returns the sent message object so caller can pin it.
     """
@@ -199,14 +193,17 @@ async def forward_poll(client, sender, msg, edit):
     if hasattr(poll, 'explanation_entities') and poll.explanation_entities:
         explanation_entities = poll.explanation_entities
 
-    # Send the poll
-    await edit.edit("Forwarding poll...")
+    # Update status in user's DM
+    try:
+        await status_msg.edit("Forwarding poll...")
+    except Exception:
+        pass
 
     sent_msg = None
     try:
         if is_quiz:
             sent_msg = await client.send_poll(
-                chat_id=sender,
+                chat_id=target_chat,
                 question=poll.question,
                 options=options,
                 is_anonymous=is_anonymous,
@@ -217,7 +214,7 @@ async def forward_poll(client, sender, msg, edit):
             )
         else:
             sent_msg = await client.send_poll(
-                chat_id=sender,
+                chat_id=target_chat,
                 question=poll.question,
                 options=options,
                 is_anonymous=is_anonymous,
@@ -238,7 +235,7 @@ async def forward_poll(client, sender, msg, edit):
                 marker = " (Correct)"
             vote_info += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s){marker}\n"
 
-        await client.send_message(sender, vote_info)
+        await client.send_message(target_chat, vote_info)
 
     except Exception as e:
         print(f"Poll forward error: {e}")
@@ -249,7 +246,7 @@ async def forward_poll(client, sender, msg, edit):
         poll_text += f"**Status:** {'Closed' if poll.is_closed else 'Open'}\n\n"
         for idx, opt in enumerate(poll.options):
             poll_text += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s)\n"
-        sent_msg = await client.send_message(sender, poll_text)
+        sent_msg = await client.send_message(target_chat, poll_text)
 
     return sent_msg
 
@@ -268,11 +265,16 @@ def register_msg_mapping(original_chat, original_msg_id, new_chat_id, new_msg_id
 # ---------------------------------------------------------------------------
 # Core message handler
 # ---------------------------------------------------------------------------
-async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
+async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, i):
 
-    """ userbot: PyrogramUserBot
+    """ 
+    userbot: PyrogramUserBot
     client: PyrogramBotClient
-    bot: TelethonBotClient """
+    bot: TelethonBotClient
+    sender: Target chat for content (SAVE_CHANNEL or user DM)
+    edit_id: Message ID of the "Processing!" status message in status_chat
+    status_chat: Chat where status/progress messages live (user's DM)
+    """
 
     edit = ""
     chat = ""
@@ -293,7 +295,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
 
             # ---- POLL HANDLING ----
             if msg.poll is not None:
-                edit = await client.edit_message_text(sender, edit_id, "Processing poll...")
+                edit = await client.edit_message_text(status_chat, edit_id, "Processing poll...")
                 sent_msg = await forward_poll(client, sender, msg, edit)
                 if sent_msg:
                     register_msg_mapping(chat, msg_id, sender, sent_msg.id)
@@ -304,7 +306,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
 
             if msg.media:
                 if msg.media==MessageMediaType.WEB_PAGE:
-                    edit = await client.edit_message_text(sender, edit_id, "Cloning.")
+                    edit = await client.edit_message_text(status_chat, edit_id, "Cloning.")
                     text = msg.text.markdown if msg.text else ""
                     rewritten = rewrite_inline_links(text, chat, sender)
                     await client.send_message(sender, rewritten)
@@ -312,7 +314,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
                     return
             if not msg.media:
                 if msg.text:
-                    edit = await client.edit_message_text(sender, edit_id, "Cloning.")
+                    edit = await client.edit_message_text(status_chat, edit_id, "Cloning.")
                     text = msg.text.markdown if msg.text else ""
                     rewritten = rewrite_inline_links(text, chat, sender)
                     sent_msg = await client.send_message(sender, rewritten)
@@ -320,7 +322,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
                     await pin_if_channel(client, sender, sent_msg.id)
                     await edit.delete()
                     return
-            edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
+            edit = await client.edit_message_text(status_chat, edit_id, "Trying to Download.")
             file = await userbot.download_media(
                 msg,
                 progress=progress_for_pyrogram,
@@ -418,7 +420,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
                 pass
             await edit.delete()
         except (ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid):
-            await client.edit_message_text(sender, edit_id, "Have you joined the channel?")
+            await client.edit_message_text(status_chat, edit_id, "Have you joined the channel?")
             return
         except PeerIdInvalid:
             # PeerIdInvalid means the bot doesn't have access to this chat
@@ -429,7 +431,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
                 new_link = f"t.me/c/{chat}/{msg_id}"
             except:
                 new_link = f"t.me/b/{chat}/{msg_id}"
-            return await get_msg(userbot, client, bot, sender, edit_id, new_link, i)
+            return await get_msg(userbot, client, bot, sender, edit_id, status_chat, new_link, i)
         except Exception as e:
             print(e)
             if "messages.SendMedia" in str(e) \
@@ -460,14 +462,14 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
                         os.remove(file)
                 except Exception as e:
                     print(e)
-                    await client.edit_message_text(sender, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
+                    await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
                     try:
                         os.remove(file)
                     except Exception:
                         return
                     return
             else:
-                await client.edit_message_text(sender, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
+                await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
                 try:
                     os.remove(file)
                 except Exception:
@@ -481,7 +483,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
             pass
         await edit.delete()
     else:
-        edit = await client.edit_message_text(sender, edit_id, "Cloning.")
+        edit = await client.edit_message_text(status_chat, edit_id, "Cloning.")
         chat = msg_link.split("t.me")[1].split("/")[1]
         try:
             msg = await client.get_messages(chat, msg_id)
@@ -499,7 +501,7 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
             if msg.empty:
                 new_link = f't.me/b/{chat}/{int(msg_id)}'
                 #recurrsion
-                return await get_msg(userbot, client, bot, sender, edit_id, new_link, i)
+                return await get_msg(userbot, client, bot, sender, edit_id, status_chat, new_link, i)
 
             # For public chats, use copy_message but also handle inline links
             sent_msg = await client.copy_message(sender, chat, msg_id)
@@ -519,9 +521,10 @@ async def get_msg(userbot, client, bot, sender, edit_id, msg_link, i):
 
         except Exception as e:
             print(e)
-            return await client.edit_message_text(sender, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
+            return await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
         await edit.delete()
 
 async def get_bulk_msg(userbot, client, sender, msg_link, i):
+    # For bulk messages, status_chat = sender (same chat for both)
     x = await client.send_message(sender, "Processing!")
-    await get_msg(userbot, client, Drone, sender, x.id, msg_link, i)
+    await get_msg(userbot, client, Drone, sender, x.id, sender, msg_link, i)

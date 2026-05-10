@@ -42,3 +42,13 @@ try:
 except Exception as e:
     print(e)
     sys.exit(1)
+
+# Resolve SAVE_CHANNEL peer for the Pyrogram bot client so it doesn't
+# throw PeerIdInvalid when first trying to send/edit messages there.
+if SAVE_CHANNEL:
+    try:
+        Bot.resolve_peer(int(SAVE_CHANNEL))
+        print(f"SAVE_CHANNEL peer resolved: {SAVE_CHANNEL}")
+    except Exception as e:
+        print(f"Warning: Could not resolve SAVE_CHANNEL peer ({SAVE_CHANNEL}): {e}")
+        print("Make sure the bot is an admin in the SAVE_CHANNEL.")

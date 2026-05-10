@@ -34,20 +34,30 @@ async def clone(event):
     if s == True:
         await event.reply(r)
         return
-    edit = await event.reply("Processing!")
-
     # Determine where to save the content:
     # If SAVE_CHANNEL is configured, save to that channel (enables pinning & inline link support)
     # Otherwise, fall back to saving in the user's DM (original behavior)
     target = int(SAVE_CHANNEL) if SAVE_CHANNEL else event.sender_id
 
+    # Status/progress messages stay in the user's DM so they can see what's happening.
+    # Content gets delivered to SAVE_CHANNEL (if configured) or the user's DM.
+    if target != event.sender_id:
+        # Save channel is different from user DM — send status message to DM
+        status_msg = await Drone.send_message(event.sender_id, "Processing!")
+        edit_id = status_msg.id
+        status_chat = event.sender_id
+    else:
+        edit = await event.reply("Processing!")
+        edit_id = edit.id
+        status_chat = event.sender_id
+
     try:
         if 't.me/+' in link:
             q = await join(userbot, link)
-            await edit.edit(q)
+            await Drone.send_message(event.sender_id, q)
             return
         if 't.me/' in link:
-            await get_msg(userbot, Bot, Drone, target, edit.id, link, 0)
+            await get_msg(userbot, Bot, Drone, target, edit_id, status_chat, link, 0)
     except FloodWait as fw:
         return await Drone.send_message(event.sender_id, f'Try again after {fw.x} seconds due to floodwait from telegram.')
     except Exception as e:
