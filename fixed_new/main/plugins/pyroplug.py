@@ -1,0 +1,661 @@
+#Github.com-Vasusen-code
+#Modified: poll forwarding, message pinning, inline link rewriting
+#Bug fixes: PeerIdInvalid, 'bytes'.get() crash, poll answers, photo upload,
+#           no-media handling, copy ALL message types (stickers, animations, etc.)
+
+import asyncio, time, os, re
+
+from .. import bot as Drone
+from .. import userbot, Bot
+from main.plugins.progress import progress_for_pyrogram
+from main.plugins.helpers import screenshot
+
+from pyrogram import Client, filters
+from pyrogram.errors import ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid, PeerIdInvalid
+from pyrogram.enums import MessageMediaType, PollType
+from ethon.pyfunc import video_metadata
+from ethon.telefunc import fast_upload
+from telethon.tl.types import DocumentAttributeVideo
+from telethon import events
+
+# ---------------------------------------------------------------------------
+# Global mapping: original chat_id+msg_id -> new msg_id in our saved channel
+# ---------------------------------------------------------------------------
+msg_map = {}
+
+# Cache of channel IDs we've already resolved to avoid repeated dialog scans
+_resolved_peers = set()
+
+# Media types that can be downloaded via userbot.download_media()
+DOWNLOADABLE_MEDIA = {
+    MessageMediaType.VIDEO, MessageMediaType.VIDEO_NOTE,
+    MessageMediaType.PHOTO, MessageMediaType.DOCUMENT,
+    MessageMediaType.AUDIO, MessageMediaType.ANIMATION,
+    MessageMediaType.VOICE, MessageMediaType.STICKER,
+}
+
+async def resolve_peer_safe(client, chat_id):
+    """Ensure Pyrogram has the access hash for chat_id in its session cache."""
+    if chat_id in _resolved_peers:
+        return True
+    try:
+        await client.resolve_peer(chat_id)
+        _resolved_peers.add(chat_id)
+        return True
+    except Exception:
+        pass
+    try:
+        await client.get_chat(chat_id)
+        _resolved_peers.add(chat_id)
+        return True
+    except Exception:
+        pass
+    try:
+        async for dialog in client.get_dialogs():
+            if dialog.chat and dialog.chat.id == chat_id:
+                _resolved_peers.add(chat_id)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def ensure_target_peer(client, target_chat):
+    """Before sending to SAVE_CHANNEL, ensure the bot has the access hash cached."""
+    if isinstance(target_chat, int) and target_chat < -1000000000000:
+        resolved = await resolve_peer_safe(client, target_chat)
+        if not resolved:
+            print(f"[WARN] Could not resolve peer for {target_chat}. "
+                  f"Make sure the bot is an admin in this channel.")
+    return True
+
+
+def thumbnail(sender):
+    if os.path.exists(f'{sender}.jpg'):
+        return f'{sender}.jpg'
+    else:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pin the message to the saved channel
+# ---------------------------------------------------------------------------
+async def pin_if_channel(client, chat_id, msg_id):
+    try:
+        await client.pin_chat_message(
+            chat_id=chat_id,
+            message_id=msg_id,
+            both_sides=False
+        )
+    except Exception as e:
+        print(f"Could not pin message {msg_id} in {chat_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Resolve chat from a Telegram message link
+# ---------------------------------------------------------------------------
+def resolve_chat_from_link(msg_link):
+    if 't.me/c/' in msg_link:
+        channel_id = msg_link.split("/")[-2]
+        chat = int('-100' + channel_id)
+        return chat, True
+    elif 't.me/b/' in msg_link:
+        chat = str(msg_link.split("/")[-2])
+        return chat, True
+    else:
+        chat = str(msg_link.split("/")[-2])
+        return chat, False
+
+
+# ---------------------------------------------------------------------------
+# inline link rewriting
+# ---------------------------------------------------------------------------
+def rewrite_inline_links(text, original_chat_id, new_chat_id):
+    if not text:
+        return text
+
+    def replace_link(match):
+        full_url = match.group(0)
+        private_match = re.match(r'(?:https?://)?t\.me/c/(\d+)/(\d+)', full_url)
+        if private_match:
+            link_chat = int('-100' + private_match.group(1))
+            link_msg_id = int(private_match.group(2))
+            map_key = (link_chat, link_msg_id)
+            if map_key in msg_map:
+                new_msg_id = msg_map[map_key]
+                if isinstance(new_chat_id, int) and str(new_chat_id).startswith('-100'):
+                    short_id = str(new_chat_id)[4:]
+                    return f"https://t.me/c/{short_id}/{new_msg_id}"
+                else:
+                    return f"https://t.me/{new_chat_id}/{new_msg_id}"
+            return full_url
+
+        public_match = re.match(r'(?:https?://)?t\.me/([a-zA-Z][\w]{4,})/(\d+)', full_url)
+        if public_match:
+            link_chat = public_match.group(1)
+            link_msg_id = int(public_match.group(2))
+            map_key_str = (link_chat, link_msg_id)
+            if map_key_str in msg_map:
+                new_msg_id = msg_map[map_key_str]
+                if isinstance(new_chat_id, int) and str(new_chat_id).startswith('-100'):
+                    short_id = str(new_chat_id)[4:]
+                    return f"https://t.me/c/{short_id}/{new_msg_id}"
+                else:
+                    return f"https://t.me/{new_chat_id}/{new_msg_id}"
+            return full_url
+
+        return full_url
+
+    pattern = r'(?:https?://)?t\.me/(?:c/\d+|\w{5,})/\d+'
+    result = re.sub(pattern, replace_link, text)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Poll forwarding
+# ---------------------------------------------------------------------------
+async def forward_poll(client, target_chat, msg, status_msg):
+    poll = msg.poll
+    if poll is None:
+        return None
+
+    options = [opt.text for opt in poll.options]
+    is_quiz = poll.type == PollType.QUIZ
+    is_anonymous = poll.is_anonymous
+
+    # In Pyrogram v4, poll.correct_option_index is directly available.
+    # Do NOT try opt.data.get() — opt.data is bytes, not a dict.
+    correct_option_index = None
+    if is_quiz:
+        correct_option_index = getattr(poll, 'correct_option_index', None)
+        if correct_option_index is None:
+            correct_option_index = 0
+
+    explanation = getattr(poll, 'explanation', None)
+    explanation_entities = getattr(poll, 'explanation_entities', None)
+
+    try:
+        await status_msg.edit("Forwarding poll...")
+    except Exception:
+        pass
+
+    sent_msg = None
+    try:
+        if is_quiz:
+            sent_msg = await client.send_poll(
+                chat_id=target_chat,
+                question=poll.question,
+                options=options,
+                is_anonymous=is_anonymous,
+                type=PollType.QUIZ,
+                correct_option_index=correct_option_index,
+                explanation=explanation,
+                explanation_entities=explanation_entities,
+            )
+        else:
+            sent_msg = await client.send_poll(
+                chat_id=target_chat,
+                question=poll.question,
+                options=options,
+                is_anonymous=is_anonymous,
+                type=PollType.REGULAR,
+            )
+
+        vote_info = "**Original Poll Vote Summary:**\n\n"
+        vote_info += f"**Question:** {poll.question}\n"
+        vote_info += f"**Total Voters:** {poll.total_voter_count}\n"
+        vote_info += f"**Poll Status:** {'Closed' if poll.is_closed else 'Open'}\n"
+        vote_info += f"**Type:** {'Quiz' if is_quiz else 'Regular'}\n"
+        vote_info += f"**Anonymous:** {'Yes' if is_anonymous else 'No'}\n\n"
+        for idx, opt in enumerate(poll.options):
+            marker = ""
+            if is_quiz and idx == correct_option_index:
+                marker = " (Correct Answer)"
+            vote_info += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s){marker}\n"
+        await client.send_message(target_chat, vote_info)
+
+    except Exception as e:
+        print(f"Poll forward error: {e}")
+        import traceback
+        traceback.print_exc()
+        poll_text = "**Poll (could not re-create):**\n\n"
+        poll_text += f"**Question:** {poll.question}\n"
+        poll_text += f"**Total Voters:** {poll.total_voter_count}\n"
+        poll_text += f"**Status:** {'Closed' if poll.is_closed else 'Open'}\n\n"
+        for idx, opt in enumerate(poll.options):
+            poll_text += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s)\n"
+        sent_msg = await client.send_message(target_chat, poll_text)
+
+    return sent_msg
+
+
+# ---------------------------------------------------------------------------
+# Fallback: copy message using userbot (handles stickers, animations, etc.)
+# ---------------------------------------------------------------------------
+async def copy_message_fallback(userbot_client, target_chat, source_chat, msg_id, caption=None):
+    """
+    Use the userbot's copy_message to copy any message type that we can't
+    handle with download+upload (stickers, animations, contacts, locations,
+    venues, dice, games, etc.). This works because the userbot has access
+    to the source chat.
+
+    Returns the sent message, or None if it fails.
+    """
+    try:
+        sent_msg = await userbot_client.copy_message(
+            chat_id=target_chat,
+            from_chat_id=source_chat,
+            message_id=msg_id,
+            caption=caption
+        )
+        return sent_msg
+    except Exception as e:
+        print(f"copy_message_fallback failed: {e}")
+        return None
+
+
+def register_msg_mapping(original_chat, original_msg_id, new_chat_id, new_msg_id):
+    msg_map[(original_chat, original_msg_id)] = new_msg_id
+
+
+# ---------------------------------------------------------------------------
+# Core message handler
+# ---------------------------------------------------------------------------
+async def get_msg(userbot, client, bot, sender, edit_id, status_chat, msg_link, i):
+
+    """ 
+    userbot: PyrogramUserBot
+    client: PyrogramBotClient  
+    bot: TelethonBotClient
+    sender: Target chat for content (SAVE_CHANNEL or user DM)
+    edit_id: Message ID of the "Processing!" status message in status_chat
+    status_chat: Chat where status/progress messages live (user's DM)
+    """
+
+    edit = ""
+    chat = ""
+    round_message = False
+    if "?single" in msg_link:
+        msg_link = msg_link.split("?single")[0]
+    msg_id = int(msg_link.split("/")[-1]) + int(i)
+    height, width, duration, thumb_path = 90, 90, 0, None
+
+    # Before doing anything, ensure the bot client can resolve the target chat
+    await ensure_target_peer(client, sender)
+
+    if 't.me/c/' in msg_link or 't.me/b/' in msg_link:
+        if 't.me/b/' in msg_link:
+            chat = str(msg_link.split("/")[-2])
+        else:
+            chat = int('-100' + str(msg_link.split("/")[-2]))
+        file = ""
+        try:
+            # Ensure the access hash for this channel is in userbot's cache.
+            await resolve_peer_safe(userbot, chat)
+            msg = await userbot.get_messages(chat, msg_id)
+
+            # ---- POLL HANDLING ----
+            if msg.poll is not None:
+                edit = await client.edit_message_text(status_chat, edit_id, "Processing poll...")
+                sent_msg = await forward_poll(client, sender, msg, edit)
+                if sent_msg:
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id)
+                await edit.delete()
+                return
+            # ---- END POLL HANDLING ----
+
+            # ---- TEXT ONLY (no media) ----
+            if not msg.media and msg.text:
+                edit = await client.edit_message_text(status_chat, edit_id, "Cloning.")
+                text = msg.text.markdown if msg.text else ""
+                rewritten = rewrite_inline_links(text, chat, sender)
+                sent_msg = await client.send_message(sender, rewritten)
+                register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                await pin_if_channel(client, sender, sent_msg.id)
+                await edit.delete()
+                return
+
+            # ---- WEB PAGE PREVIEW ----
+            if msg.media == MessageMediaType.WEB_PAGE:
+                edit = await client.edit_message_text(status_chat, edit_id, "Cloning.")
+                text = msg.text.markdown if msg.text else ""
+                rewritten = rewrite_inline_links(text, chat, sender)
+                await client.send_message(sender, rewritten)
+                await edit.delete()
+                return
+
+            # ---- DOWNLOADABLE MEDIA ----
+            if msg.media in DOWNLOADABLE_MEDIA:
+                edit = await client.edit_message_text(status_chat, edit_id, "Trying to Download.")
+                file = await userbot.download_media(
+                    msg,
+                    progress=progress_for_pyrogram,
+                    progress_args=(
+                        client,
+                        "**DOWNLOADING:**\n",
+                        edit,
+                        time.time()
+                    )
+                )
+
+                # If download failed or file is empty, try copy_message as fallback
+                if not file or not os.path.exists(file) or os.path.getsize(file) == 0:
+                    print(f"[WARN] download_media returned empty/missing file for msg {msg_id}, trying copy_message fallback")
+                    edit = await client.edit_message_text(status_chat, edit_id, "Trying to copy...")
+                    caption = None
+                    if msg.caption is not None:
+                        caption = rewrite_inline_links(msg.caption, chat, sender)
+                    sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
+                    if sent_msg:
+                        register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id)
+                        await edit.delete()
+                    else:
+                        await client.edit_message_text(status_chat, edit_id, f"Could not save message `{msg_link}`")
+                    return
+
+                print(file)
+                await edit.edit('Preparing to Upload!')
+                caption = None
+                if msg.caption is not None:
+                    caption = rewrite_inline_links(msg.caption, chat, sender)
+
+                sent_msg = None
+                if msg.media==MessageMediaType.VIDEO_NOTE:
+                    round_message = True
+                    print("Trying to get metadata")
+                    data = video_metadata(file)
+                    height, width, duration = data["height"], data["width"], data["duration"]
+                    print(f'd: {duration}, w: {width}, h:{height}')
+                    try:
+                        thumb_path = await screenshot(file, duration, sender)
+                    except Exception:
+                        thumb_path = None
+                    sent_msg = await client.send_video_note(
+                        chat_id=sender,
+                        video_note=file,
+                        length=height, duration=duration,
+                        thumb=thumb_path,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client,
+                            '**UPLOADING:**\n',
+                            edit,
+                            time.time()
+                        )
+                    )
+                elif msg.media==MessageMediaType.VIDEO and msg.video.mime_type in ["video/mp4", "video/x-matroska"]:
+                    print("Trying to get metadata")
+                    data = video_metadata(file)
+                    height, width, duration = data["height"], data["width"], data["duration"]
+                    print(f'd: {duration}, w: {width}, h:{height}')
+                    try:
+                        thumb_path = await screenshot(file, duration, sender)
+                    except Exception:
+                        thumb_path = None
+                    sent_msg = await client.send_video(
+                        chat_id=sender,
+                        video=file,
+                        caption=caption,
+                        supports_streaming=True,
+                        height=height, width=width, duration=duration,
+                        thumb=thumb_path,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client,
+                            '**UPLOADING:**\n',
+                            edit,
+                            time.time()
+                        )
+                    )
+
+                elif msg.media==MessageMediaType.PHOTO:
+                    await edit.edit("Uploading photo.")
+                    try:
+                        sent_msg = await client.send_photo(
+                            chat_id=sender,
+                            photo=file,
+                            caption=caption,
+                            progress=progress_for_pyrogram,
+                            progress_args=(
+                                client,
+                                '**UPLOADING:**\n',
+                                edit,
+                                time.time()
+                            )
+                        )
+                    except Exception as photo_err:
+                        print(f"send_photo failed, falling back to bot.send_file: {photo_err}")
+                        sent_msg = await bot.send_file(sender, file, caption=caption)
+                elif msg.media==MessageMediaType.STICKER:
+                    # Send sticker as document to preserve it
+                    sent_msg = await client.send_document(
+                        sender, file,
+                        caption=caption,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client, '**UPLOADING:**\n', edit, time.time()
+                        )
+                    )
+                elif msg.media==MessageMediaType.ANIMATION:
+                    # GIF / animation - send as animation
+                    try:
+                        sent_msg = await client.send_animation(
+                            chat_id=sender,
+                            animation=file,
+                            caption=caption,
+                            progress=progress_for_pyrogram,
+                            progress_args=(
+                                client, '**UPLOADING:**\n', edit, time.time()
+                            )
+                        )
+                    except Exception:
+                        sent_msg = await client.send_document(
+                            sender, file,
+                            caption=caption,
+                            progress=progress_for_pyrogram,
+                            progress_args=(
+                                client, '**UPLOADING:**\n', edit, time.time()
+                            )
+                        )
+                elif msg.media==MessageMediaType.AUDIO:
+                    sent_msg = await client.send_audio(
+                        chat_id=sender,
+                        audio=file,
+                        caption=caption,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client, '**UPLOADING:**\n', edit, time.time()
+                        )
+                    )
+                elif msg.media==MessageMediaType.VOICE:
+                    sent_msg = await client.send_voice(
+                        chat_id=sender,
+                        voice=file,
+                        caption=caption,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client, '**UPLOADING:**\n', edit, time.time()
+                        )
+                    )
+                else:
+                    thumb_path=thumbnail(sender)
+                    sent_msg = await client.send_document(
+                        sender, file,
+                        caption=caption,
+                        thumb=thumb_path,
+                        progress=progress_for_pyrogram,
+                        progress_args=(
+                            client, '**UPLOADING:**\n', edit, time.time()
+                        )
+                    )
+
+                # Register mapping and pin the message
+                if sent_msg:
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id)
+
+                try:
+                    os.remove(file)
+                    if os.path.isfile(file) == True:
+                        os.remove(file)
+                except Exception:
+                    pass
+                await edit.delete()
+
+            # ---- OTHER MEDIA (contact, location, venue, dice, game, etc.) ----
+            # These can't be downloaded, so use copy_message via the userbot
+            else:
+                edit = await client.edit_message_text(status_chat, edit_id, "Copying message...")
+                caption = None
+                if msg.caption is not None:
+                    caption = rewrite_inline_links(msg.caption, chat, sender)
+                sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
+                if sent_msg:
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id)
+                else:
+                    # Last resort: send whatever text we can extract
+                    fallback_text = ""
+                    if msg.text:
+                        fallback_text = msg.text.markdown if msg.text else ""
+                    if msg.caption:
+                        fallback_text += ("\n" if fallback_text else "") + msg.caption
+                    if fallback_text:
+                        rewritten = rewrite_inline_links(fallback_text, chat, sender)
+                        sent_msg = await client.send_message(sender, f"[Unsupported media] {rewritten}")
+                        register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id)
+                    else:
+                        print(f"[WARN] Could not save message {msg_id} — no text, no downloadable media")
+                await edit.delete()
+                return
+
+        except (ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid):
+            await client.edit_message_text(status_chat, edit_id, "Have you joined the channel?")
+            return
+        except PeerIdInvalid:
+            await client.edit_message_text(
+                status_chat, edit_id,
+                "**Peer id invalid** — the userbot account is not a member of "
+                "this channel.\n\nSend the channel's invite link first so the "
+                "userbot can join, then retry."
+            )
+            return
+        except Exception as e:
+            print(e)
+            if "messages.SendMedia" in str(e) \
+            or "SaveBigFilePartRequest" in str(e) \
+            or "SendMediaRequest" in str(e) \
+            or "number of file parts" in str(e) \
+            or str(e) == "File size equals to 0 B":
+                try:
+                    if msg.media==MessageMediaType.VIDEO and msg.video.mime_type in ["video/mp4", "video/x-matroska"]:
+                        UT = time.time()
+                        uploader = await fast_upload(f'{file}', f'{file}', UT, bot, edit, '**UPLOADING:**')
+                        attributes = [DocumentAttributeVideo(duration=duration, w=width, h=height, round_message=round_message, supports_streaming=True)]
+                        sent_msg = await bot.send_file(sender, uploader, caption=caption, thumb=thumb_path, attributes=attributes, force_document=False)
+                    elif msg.media==MessageMediaType.VIDEO_NOTE:
+                        UT = time.time()
+                        uploader = await fast_upload(f'{file}', f'{file}', UT, bot, edit, '**UPLOADING:**')
+                        attributes = [DocumentAttributeVideo(duration=duration, w=width, h=height, round_message=round_message, supports_streaming=True)]
+                        sent_msg = await bot.send_file(sender, uploader, caption=caption, thumb=thumb_path, attributes=attributes, force_document=False)
+                    elif msg.media==MessageMediaType.PHOTO:
+                        UT = time.time()
+                        sent_msg = await bot.send_file(sender, file, caption=caption)
+                    else:
+                        UT = time.time()
+                        uploader = await fast_upload(f'{file}', f'{file}', UT, bot, edit, '**UPLOADING:**')
+                        sent_msg = await bot.send_file(sender, uploader, caption=caption, thumb=thumb_path, force_document=True)
+
+                    if sent_msg:
+                        register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id)
+
+                    if os.path.isfile(file) == True:
+                        os.remove(file)
+                except Exception as e2:
+                    print(f"Telethon fallback also failed: {e2}")
+                    # Telethon upload failed too — try copy_message as last resort
+                    try:
+                        os.remove(file)
+                    except Exception:
+                        pass
+                    caption = None
+                    if msg.caption is not None:
+                        caption = rewrite_inline_links(msg.caption, chat, sender)
+                    sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
+                    if sent_msg:
+                        register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                        await pin_if_channel(client, sender, sent_msg.id)
+                        await client.edit_message_text(status_chat, edit_id, "Saved via copy (upload failed).")
+                    else:
+                        await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e2)}')
+                    return
+            else:
+                # Non-upload error — try copy_message fallback before giving up
+                caption = None
+                if msg.caption is not None:
+                    caption = rewrite_inline_links(msg.caption, chat, sender)
+                sent_msg = await copy_message_fallback(userbot, sender, chat, msg_id, caption)
+                if sent_msg:
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id)
+                    await client.edit_message_text(status_chat, edit_id, "Saved via copy (direct upload failed).")
+                else:
+                    await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
+                try:
+                    os.remove(file)
+                except Exception:
+                    pass
+                return
+        try:
+            os.remove(file)
+            if os.path.isfile(file) == True:
+                os.remove(file)
+        except Exception:
+            pass
+        await edit.delete()
+    else:
+        edit = await client.edit_message_text(status_chat, edit_id, "Cloning.")
+        chat = msg_link.split("t.me")[1].split("/")[1]
+        try:
+            msg = await client.get_messages(chat, msg_id)
+
+            # ---- POLL HANDLING for public chats ----
+            if msg.poll is not None:
+                sent_msg = await forward_poll(client, sender, msg, edit)
+                if sent_msg:
+                    register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                    await pin_if_channel(client, sender, sent_msg.id)
+                await edit.delete()
+                return
+
+            if msg.empty:
+                new_link = f't.me/b/{chat}/{int(msg_id)}'
+                return await get_msg(userbot, client, bot, sender, edit_id, status_chat, new_link, i)
+
+            # For public chats, use copy_message
+            sent_msg = await client.copy_message(sender, chat, msg_id)
+            if sent_msg:
+                register_msg_mapping(chat, msg_id, sender, sent_msg.id)
+                await pin_if_channel(client, sender, sent_msg.id)
+
+                if msg.text:
+                    original_text = msg.text.markdown if msg.text else ""
+                    rewritten = rewrite_inline_links(original_text, chat, sender)
+                    if rewritten != original_text:
+                        try:
+                            await client.edit_message_text(sender, sent_msg.id, rewritten)
+                        except Exception as e:
+                            print(f"Could not edit message for inline link rewriting: {e}")
+
+        except Exception as e:
+            print(e)
+            return await client.edit_message_text(status_chat, edit_id, f'Failed to save: `{msg_link}`\n\nError: {str(e)}')
+        await edit.delete()
+
+async def get_bulk_msg(userbot, client, sender, msg_link, i):
+    x = await client.send_message(sender, "Processing!")
+    await get_msg(userbot, client, Drone, sender, x.id, sender, msg_link, i)

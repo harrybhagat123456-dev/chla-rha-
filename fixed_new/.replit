@@ -1,0 +1,15 @@
+run = "bash start.sh"
+entrypoint = "main/__main__.py"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "bash start.sh"]
+deploymentTarget = "cloudrun"
+build = "pip install -r requirements.txt"
+
+# Disable auto git push from Replit to avoid conflicts
+# The deployment server should only PULL from GitHub, never PUSH
+[git]
+autopush = false
