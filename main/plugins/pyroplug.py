@@ -3,7 +3,7 @@
 #Bug fixes: PeerIdInvalid, 'bytes'.get() crash, poll answers, photo upload,
 #           no-media handling, copy ALL message types (stickers, animations, etc.)
 
-import asyncio, time, os, re
+import asyncio, time, os, re, json, urllib.parse
 
 from .. import bot as Drone
 from .. import userbot, Bot
@@ -276,6 +276,200 @@ def _extract_correct_option(poll):
     return correct_idx, explanation, explanation_entities
 
 
+# ---------------------------------------------------------------------------
+# OCR + UPSC Answer Search
+#
+# When a quiz poll has an image, this module:
+#   1. Downloads the image
+#   2. OCRs it using pytesseract to extract question text
+#   3. Searches UPSC sites (BYJU'S, ClearIAS, Drishti IAS, etc.) for the answer
+#   4. Matches the found answer against poll options
+#   5. Returns the correct option index (or None if unsure)
+# ---------------------------------------------------------------------------
+
+# UPSC answer sites to search (ordered by reliability)
+_UPSC_SEARCH_QUERIES = [
+    'site:byjus.com UPSC question answer {question}',
+    'site:clearias.com UPSC question answer {question}',
+    'site:drishtiias.com UPSC question answer {question}',
+    'site:iasbaba.com UPSC question answer {question}',
+    'site:mrunal.org UPSC question answer {question}',
+    'site:visionias.in UPSC question answer {question}',
+    'UPSC previous year question answer {question}',
+    'UPSC answer key {question}',
+]
+
+# Known UPSC answer patterns in search snippets
+_ANSWER_PATTERNS = [
+    re.compile(r'(?:correct\s*answer|answer\s*(?:is|:)|option\s*(?:is|:))\s*[–\-:]?\s*(?:option\s*)?([A-Da-d])', re.IGNORECASE),
+    re.compile(r'(?:answer|option)\s*(?:key|is)\s*[–\-:]?\s*\(?([A-Da-d])\)?', re.IGNORECASE),
+    re.compile(r'\b([A-Da-d])\)\s*(?:is\s+correct|✓|✔|✅)', re.IGNORECASE),
+    re.compile(r'\bans(?:wer)?\s*(?:\.|:|\-)\s*([A-Da-d])\b', re.IGNORECASE),
+    re.compile(r'\boption\s+([A-Da-d])\b.*?(?:correct|right|answer)', re.IGNORECASE),
+    re.compile(r'(?:correct|right)\s*(?:option|answer)\s*(?:is|:)\s*([A-Da-d])', re.IGNORECASE),
+]
+
+# Option letter mapping
+_LETTER_TO_INDEX = {'a': 0, 'b': 1, 'c': 2, 'd': 3}
+
+
+def _ocr_image(image_path):
+    """Run pytesseract OCR on an image and return extracted text."""
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(image_path)
+        text = pytesseract.image_to_string(img, lang='eng')
+        return text.strip()
+    except ImportError:
+        print("[OCR] pytesseract or PIL not installed — OCR skipped")
+        return None
+    except Exception as e:
+        print(f"[OCR] OCR failed: {e}")
+        return None
+
+
+async def _search_upsc_answer(question_text, options_list):
+    """
+    Search UPSC answer sites for the correct answer to a question.
+    Returns the correct option index (0-based) or None.
+    """
+    if not question_text or len(question_text.strip()) < 10:
+        return None
+
+    # Clean up the question text for searching (take first ~150 chars)
+    search_text = question_text.strip().replace('\n', ' ')[:150]
+
+    # Try multiple search queries
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        print("[SEARCH] duckduckgo_search not installed — UPSC search skipped")
+        return None
+
+    # Build option letter map (A=0, B=1, C=2, D=3)
+    option_count = len(options_list)
+    letter_map = {}
+    for i in range(min(option_count, 4)):
+        letter_map[chr(65 + i)] = i  # A->0, B->1, C->2, D->3
+
+    best_answer = None
+    confidence = 0
+
+    for query_template in _UPSC_SEARCH_QUERIES:
+        query = query_template.format(question=search_text)
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=5))
+
+            for result in results:
+                snippet = result.get('body', '') or result.get('title', '')
+                if not snippet:
+                    continue
+
+                # Try each answer pattern
+                for pattern in _ANSWER_PATTERNS:
+                    match = pattern.search(snippet)
+                    if match:
+                        letter = match.group(1).upper()
+                        if letter in letter_map:
+                            idx = letter_map[letter]
+                            # If this is from a dedicated UPSC site, give higher confidence
+                            url = result.get('href', '')
+                            is_upsc_site = any(site in url for site in
+                                ['byjus.com', 'clearias.com', 'drishtiias.com',
+                                 'iasbaba.com', 'mrunal.org', 'visionias.in',
+                                 'neostencil.com', 'gradeup.co', 'unacademy.com'])
+
+                            this_confidence = 2 if is_upsc_site else 1
+
+                            # If multiple results agree, increase confidence
+                            if best_answer is not None and best_answer == idx:
+                                this_confidence += 3
+
+                            if this_confidence > confidence:
+                                best_answer = idx
+                                confidence = this_confidence
+                                print(f"[SEARCH] Found answer: Option {letter} (index {idx}) "
+                                      f"confidence={confidence} from {url[:60]}")
+
+        except Exception as e:
+            print(f"[SEARCH] Search failed for query '{query[:50]}': {e}")
+            continue
+
+    # Only return if we have reasonable confidence
+    if best_answer is not None and confidence >= 2:
+        return best_answer
+
+    return None
+
+
+async def ocr_and_search_answer(userbot_client, msg, poll):
+    """
+    If the message containing a poll also has an image (or nearby image),
+    OCR it and search UPSC sites for the correct answer.
+
+    Returns (correct_idx, source_info) or (None, None).
+    correct_idx: 0-based index of the correct option
+    source_info: string describing how the answer was found
+    """
+    image_path = None
+
+    # Case 1: The poll message itself has a photo
+    if msg.photo:
+        try:
+            image_path = await userbot_client.download_media(msg, file_name="ocr_temp.jpg")
+            print(f"[OCR] Downloaded poll image to {image_path}")
+        except Exception as e:
+            print(f"[OCR] Could not download poll image: {e}")
+
+    # Case 2: The previous message might have the question image
+    if not image_path or not os.path.exists(image_path or ''):
+        try:
+            chat_id = msg.chat.id if msg.chat else None
+            msg_id = msg.id if msg.id else None
+            if chat_id and msg_id:
+                prev_msg = await userbot_client.get_messages(chat_id, msg_id - 1)
+                if prev_msg and prev_msg.photo:
+                    image_path = await userbot_client.download_media(prev_msg, file_name="ocr_temp.jpg")
+                    print(f"[OCR] Downloaded previous message image to {image_path}")
+        except Exception as e:
+            print(f"[OCR] Could not get previous message image: {e}")
+
+    if not image_path or not os.path.exists(image_path or ''):
+        return None, None
+
+    # OCR the image
+    ocr_text = _ocr_image(image_path)
+    if not ocr_text:
+        try:
+            os.remove(image_path)
+        except:
+            pass
+        return None, None
+
+    print(f"[OCR] Extracted text: {ocr_text[:200]}")
+
+    # Get the poll options
+    options = [opt.text for opt in poll.options]
+
+    # Search for the answer
+    correct_idx = await _search_upsc_answer(ocr_text, options)
+
+    # Cleanup temp file
+    try:
+        os.remove(image_path)
+    except:
+        pass
+
+    if correct_idx is not None:
+        letter = chr(65 + correct_idx)
+        source_info = f"Found via OCR + UPSC search: Option {letter}"
+        return correct_idx, source_info
+
+    return None, None
+
+
 async def _send_caption(client, target_chat, msg, original_chat, sender):
     """Send the original message's caption as a pink-styled blockquote message."""
     caption_text = None
@@ -323,6 +517,21 @@ async def forward_poll(client, target_chat, msg, status_msg, original_chat=None,
 
     # Try to find the correct answer for quiz polls
     correct_idx, explanation, explanation_entities = _extract_correct_option(poll)
+    answer_source = "extracted from poll object"
+
+    # ---- If we couldn't find the answer, try OCR + UPSC search ----
+    if correct_idx is None and is_quiz:
+        try:
+            await status_msg.edit("Searching for correct answer via OCR + UPSC sites...")
+        except Exception:
+            pass
+        ocr_idx, ocr_source = await ocr_and_search_answer(userbot, msg, poll)
+        if ocr_idx is not None:
+            correct_idx = ocr_idx
+            answer_source = ocr_source
+            print(f"[POLL] Correct answer found via OCR+search: option index {correct_idx}")
+        else:
+            print(f"[POLL] OCR+search did not find a confident answer — will try regular poll")
 
     # Also get the raw option data bytes for Telethon fallback
     option_data_list = []
@@ -506,6 +715,8 @@ async def forward_poll(client, target_chat, msg, status_msg, original_chat=None,
                     vote_info += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s)\n"
             if explanation:
                 vote_info += f"\n**Explanation:** {explanation}"
+            # Show where the answer came from
+            vote_info += f"\n\n_Answer source: {answer_source}_"
             await client.send_message(target_chat, vote_info)
         except Exception as e:
             print(f"[POLL] Could not send vote summary: {e}")

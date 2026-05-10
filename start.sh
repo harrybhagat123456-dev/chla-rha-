@@ -17,6 +17,13 @@ if [ -f "sync_from_github.sh" ]; then
     bash sync_from_github.sh
 fi
 
+# Install tesseract-ocr system package for OCR (needed by pytesseract)
+if ! command -v tesseract &> /dev/null; then
+    echo "[SETUP] Installing tesseract-ocr for image OCR..."
+    apt-get update -qq 2>/dev/null && apt-get install -y -qq tesseract-ocr tesseract-ocr-eng 2>/dev/null
+    pip install pytesseract Pillow duckduckgo-search 2>/dev/null
+fi
+
 # Start the bot
 echo "starting Bot ~@DroneBots";
 python3 -m main
