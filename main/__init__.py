@@ -12,14 +12,16 @@ import logging, time, sys, traceback
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
                     level=logging.WARNING)
 
-# variables
-API_ID = config("API_ID", default=None, cast=lambda x: int(x) if x is not None else None)
+# variables — safe cast: returns None instead of crashing when env var is unset
+_safe_int = lambda x: int(x) if x is not None else None
+
+API_ID = config("API_ID", default=None, cast=_safe_int)
 API_HASH = config("API_HASH", default=None)
 BOT_TOKEN = config("BOT_TOKEN", default=None)
 SESSION = config("SESSION", default=None)
 FORCESUB = config("FORCESUB", default=None)
-AUTH = config("AUTH", default=None, cast=lambda x: int(x) if x is not None else None)
-SAVE_CHANNEL = config("SAVE_CHANNEL", default=None, cast=lambda x: int(x) if x is not None else None)  # Channel/group ID where content is saved (for pinning & inline link rewriting)
+AUTH = config("AUTH", default=None, cast=_safe_int)
+SAVE_CHANNEL = config("SAVE_CHANNEL", default=None, cast=_safe_int)  # Channel/group ID where content is saved (for pinning & inline link rewriting)
 
 # ---------------------------------------------------------------------------
 # MONKEY-PATCH: Fix Pyrogram's get_peer_type to handle unknown channel IDs
