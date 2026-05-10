@@ -152,8 +152,65 @@ def rewrite_inline_links(text, original_chat_id, new_chat_id):
 
 
 # ---------------------------------------------------------------------------
-# Poll forwarding
+# Poll forwarding — multi-strategy approach
+#
+# Strategy order:
+#   1. Try quiz poll via Pyrogram send_poll (with correct_option_index if available)
+#   2. Try quiz poll via Telethon raw API (works even without correct_option_index attr)
+#   3. Try regular poll via Pyrogram send_poll (loses quiz marking but creates the poll)
+#   4. Fallback: send poll data as text
 # ---------------------------------------------------------------------------
+def _extract_correct_option(poll):
+    """
+    Try every possible way to find the correct option index for a quiz poll.
+    Returns (index, explanation, explanation_entities) or (None, None, None).
+    """
+    correct_idx = None
+    explanation = None
+    explanation_entities = None
+
+    # Method 1: Direct attribute (Pyrogram >= 2.0)
+    if hasattr(poll, 'correct_option_index') and poll.correct_option_index is not None:
+        correct_idx = poll.correct_option_index
+        print(f"[POLL] Found correct_option_index via attribute: {correct_idx}")
+
+    # Method 2: Check _raw attribute (some Pyrogram versions store it here)
+    if correct_idx is None and hasattr(poll, '_raw'):
+        raw = poll._raw
+        if hasattr(raw, 'correct_answer') and raw.correct_answer:
+            # correct_answer is bytes matching one of the option.data values
+            try:
+                for i, opt in enumerate(poll.options):
+                    opt_data = getattr(opt, 'data', None) or getattr(opt, 'option', None)
+                    if opt_data and opt_data == raw.correct_answer:
+                        correct_idx = i
+                        print(f"[POLL] Found correct answer via _raw.correct_answer: option {i}")
+                        break
+            except Exception as e:
+                print(f"[POLL] _raw method failed: {e}")
+
+    # Method 3: Check results in the Poll object
+    if correct_idx is None and hasattr(poll, 'results') and poll.results:
+        results = poll.results
+        if hasattr(results, 'results') and results.results:
+            for i, r in enumerate(results.results):
+                if getattr(r, 'correct', False):
+                    correct_idx = i
+                    print(f"[POLL] Found correct answer via results.results[{i}].correct")
+                    break
+
+    # Extract explanation
+    explanation = getattr(poll, 'explanation', None)
+    explanation_entities = getattr(poll, 'explanation_entities', None)
+    # Also try from _raw
+    if explanation is None and hasattr(poll, '_raw'):
+        raw = poll._raw
+        explanation = getattr(raw, 'solution', None)
+        explanation_entities = getattr(raw, 'solution_entities', None)
+
+    return correct_idx, explanation, explanation_entities
+
+
 async def forward_poll(client, target_chat, msg, status_msg):
     poll = msg.poll
     if poll is None:
@@ -163,16 +220,15 @@ async def forward_poll(client, target_chat, msg, status_msg):
     is_quiz = poll.type == PollType.QUIZ
     is_anonymous = poll.is_anonymous
 
-    # In Pyrogram v4, poll.correct_option_index is directly available.
-    # Do NOT try opt.data.get() — opt.data is bytes, not a dict.
-    correct_option_index = None
-    if is_quiz:
-        correct_option_index = getattr(poll, 'correct_option_index', None)
-        if correct_option_index is None:
-            correct_option_index = 0
+    # Try to find the correct answer for quiz polls
+    correct_idx, explanation, explanation_entities = _extract_correct_option(poll)
 
-    explanation = getattr(poll, 'explanation', None)
-    explanation_entities = getattr(poll, 'explanation_entities', None)
+    # Also get the raw option data bytes for Telethon fallback
+    option_data_list = []
+    for opt in poll.options:
+        data = getattr(opt, 'data', None) or getattr(opt, 'option', None)
+        if data:
+            option_data_list.append(data)
 
     try:
         await status_msg.edit("Forwarding poll...")
@@ -180,19 +236,120 @@ async def forward_poll(client, target_chat, msg, status_msg):
         pass
 
     sent_msg = None
-    try:
-        if is_quiz:
+
+    # ---- Strategy 1: Pyrogram send_poll (quiz with correct answer) ----
+    if is_quiz and correct_idx is not None:
+        try:
             sent_msg = await client.send_poll(
                 chat_id=target_chat,
                 question=poll.question,
                 options=options,
                 is_anonymous=is_anonymous,
                 type=PollType.QUIZ,
-                correct_option_index=correct_option_index,
+                correct_option_index=correct_idx,
                 explanation=explanation,
                 explanation_entities=explanation_entities,
             )
-        else:
+            print(f"[POLL] Strategy 1 success: quiz poll with correct answer at index {correct_idx}")
+        except Exception as e:
+            print(f"[POLL] Strategy 1 failed (Pyrogram quiz): {e}")
+            sent_msg = None
+
+    # ---- Strategy 2: Telethon raw API for quiz poll ----
+    if is_quiz and sent_msg is None:
+        try:
+            from telethon.tl.types import InputMediaPoll, Poll as TLPoll, PollAnswer, TextWithEntities
+            from telethon.tl.functions.messages import SendMediaRequest
+
+            # Build TL Poll object
+            tl_answers = []
+            for i, opt_text in enumerate(options):
+                # Use the original option data bytes if available, else generate simple ones
+                if i < len(option_data_list):
+                    opt_bytes = option_data_list[i]
+                else:
+                    opt_bytes = bytes([i + 1])
+                tl_answers.append(PollAnswer(text=opt_text, option=opt_bytes))
+
+            tl_poll = TLPoll(
+                id=0,  # Telegram assigns the ID
+                question=poll.question,
+                answers=tl_answers,
+                closed=poll.is_closed,
+                public_voters=not is_anonymous,
+                multiple_choice=False,
+                quiz=True,
+            )
+
+            # Build correct_answer from the data bytes
+            correct_answer_bytes = None
+            if correct_idx is not None and correct_idx < len(option_data_list):
+                correct_answer_bytes = option_data_list[correct_idx]
+            elif correct_idx is not None:
+                correct_answer_bytes = bytes([correct_idx + 1])
+
+            # Build explanation
+            solution = None
+            solution_entities = None
+            if explanation:
+                solution = explanation
+                # Convert Pyrogram entities to Telethon if needed
+                if explanation_entities:
+                    from telethon.tl.types import MessageEntityBold, MessageEntityItalic, MessageEntityCode, MessageEntityTextUrl
+                    solution_entities = []
+                    for ent in explanation_entities:
+                        te = None
+                        if hasattr(ent, 'type'):
+                            if ent.type.name == 'bold':
+                                te = MessageEntityBold(offset=ent.offset, length=ent.length)
+                            elif ent.type.name == 'italic':
+                                te = MessageEntityItalic(offset=ent.offset, length=ent.length)
+                            elif ent.type.name == 'code':
+                                te = MessageEntityCode(offset=ent.offset, length=ent.length)
+                            elif ent.type.name == 'text_link':
+                                te = MessageEntityTextUrl(offset=ent.offset, length=ent.length, url=ent.url)
+                        if te:
+                            solution_entities.append(te)
+
+            media = InputMediaPoll(
+                poll=tl_poll,
+                correct_answer=correct_answer_bytes,
+                solution=solution,
+                solution_entities=solution_entities or [],
+            )
+
+            from .. import bot as Drone
+            result = await Drone(SendMediaRequest(
+                peer=target_chat,
+                media=media,
+                message='',
+                random_id=int(time.time() * 1000),
+            ))
+
+            # Get the sent message ID from the result
+            if result and hasattr(result, 'updates'):
+                for update in result.updates:
+                    if hasattr(update, 'message') and hasattr(update.message, 'id'):
+                        sent_msg = await client.get_messages(target_chat, update.message.id)
+                        break
+                    elif hasattr(update, 'id'):
+                        sent_msg = await client.get_messages(target_chat, update.id)
+                        break
+
+            if sent_msg:
+                print(f"[POLL] Strategy 2 success: quiz poll via Telethon raw API")
+            else:
+                print(f"[POLL] Strategy 2: poll sent but could not retrieve sent message")
+
+        except Exception as e:
+            print(f"[POLL] Strategy 2 failed (Telethon quiz): {e}")
+            import traceback
+            traceback.print_exc()
+            sent_msg = None
+
+    # ---- Strategy 3: Regular poll via Pyrogram (no quiz marking) ----
+    if sent_msg is None:
+        try:
             sent_msg = await client.send_poll(
                 chat_id=target_chat,
                 question=poll.question,
@@ -200,31 +357,47 @@ async def forward_poll(client, target_chat, msg, status_msg):
                 is_anonymous=is_anonymous,
                 type=PollType.REGULAR,
             )
+            print(f"[POLL] Strategy 3 success: regular poll (quiz marking lost)")
+        except Exception as e:
+            print(f"[POLL] Strategy 3 failed (Pyrogram regular): {e}")
+            sent_msg = None
 
-        vote_info = "**Original Poll Vote Summary:**\n\n"
-        vote_info += f"**Question:** {poll.question}\n"
-        vote_info += f"**Total Voters:** {poll.total_voter_count}\n"
-        vote_info += f"**Poll Status:** {'Closed' if poll.is_closed else 'Open'}\n"
-        vote_info += f"**Type:** {'Quiz' if is_quiz else 'Regular'}\n"
-        vote_info += f"**Anonymous:** {'Yes' if is_anonymous else 'No'}\n\n"
-        for idx, opt in enumerate(poll.options):
-            marker = ""
-            if is_quiz and idx == correct_option_index:
-                marker = " (Correct Answer)"
-            vote_info += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s){marker}\n"
-        await client.send_message(target_chat, vote_info)
-
-    except Exception as e:
-        print(f"Poll forward error: {e}")
-        import traceback
-        traceback.print_exc()
+    # ---- Strategy 4: Text fallback ----
+    if sent_msg is None:
         poll_text = "**Poll (could not re-create):**\n\n"
         poll_text += f"**Question:** {poll.question}\n"
         poll_text += f"**Total Voters:** {poll.total_voter_count}\n"
-        poll_text += f"**Status:** {'Closed' if poll.is_closed else 'Open'}\n\n"
+        poll_text += f"**Status:** {'Closed' if poll.is_closed else 'Open'}\n"
+        poll_text += f"**Type:** {'Quiz' if is_quiz else 'Regular'}\n\n"
         for idx, opt in enumerate(poll.options):
-            poll_text += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s)\n"
+            marker = ""
+            if is_quiz and idx == correct_idx:
+                marker = " (Correct Answer)"
+            poll_text += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s){marker}\n"
+        if explanation:
+            poll_text += f"\n**Explanation:** {explanation}"
         sent_msg = await client.send_message(target_chat, poll_text)
+        print(f"[POLL] Strategy 4: text fallback")
+
+    # ---- Always send vote summary ----
+    else:
+        try:
+            vote_info = "**Original Poll Vote Summary:**\n\n"
+            vote_info += f"**Question:** {poll.question}\n"
+            vote_info += f"**Total Voters:** {poll.total_voter_count}\n"
+            vote_info += f"**Poll Status:** {'Closed' if poll.is_closed else 'Open'}\n"
+            vote_info += f"**Type:** {'Quiz' if is_quiz else 'Regular'}\n"
+            vote_info += f"**Anonymous:** {'Yes' if is_anonymous else 'No'}\n\n"
+            for idx, opt in enumerate(poll.options):
+                marker = ""
+                if is_quiz and idx == correct_idx:
+                    marker = " (Correct Answer)"
+                vote_info += f"  {idx + 1}. {opt.text} - {opt.voter_count} vote(s){marker}\n"
+            if explanation:
+                vote_info += f"\n**Explanation:** {explanation}"
+            await client.send_message(target_chat, vote_info)
+        except Exception as e:
+            print(f"[POLL] Could not send vote summary: {e}")
 
     return sent_msg
 
