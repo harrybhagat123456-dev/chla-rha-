@@ -1,0 +1,11 @@
+run = "bash start.sh"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["bash", "start.sh"]
+deploymentTarget = "cloudrun"
+
+[[deployment.build]]
+command = "pip install -r requirements.txt"
